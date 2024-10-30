@@ -1,7 +1,8 @@
+use core::ffi;
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::wasi::prelude::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
 #[derive(Copy, Clone, Debug)]
 #[repr(u8, align(1))]
@@ -133,28 +134,13 @@ impl WasiAddrinfo {
     /// Get Address Information
     ///
     /// As calling FFI, use buffer as parameter in order to avoid memory leak.
+    /// TODO: make it actually return the same amount of info as getaddinfo in C
     pub fn get_addrinfo(
         node: &str,
         service: &str,
         hints: &WasiAddrinfo,
         max_reslen: usize,
-        sockaddr: &mut Vec<WasiSockaddr>,
-        sockbuff: &mut Vec<[u8; 26]>,
-        ai_canonname: &mut Vec<String>,
-    ) -> io::Result<Vec<WasiAddrinfo>> {
-        #[link(wasm_import_module = "wasi_snapshot_preview1")]
-        extern "C" {
-            pub fn sock_getaddrinfo(
-                node: *const u8,
-                node_len: u32,
-                server: *const u8,
-                server_len: u32,
-                hint: *const WasiAddrinfo,
-                res: *mut u32,
-                max_len: u32,
-                res_len: *mut u32,
-            ) -> u32;
-        }
+    ) -> io::Result<Vec<socket_wamr::WasiAddrInfo>> {
         let mut node = node.to_string();
         let mut service = service.to_string();
 
@@ -166,39 +152,39 @@ impl WasiAddrinfo {
             service.push('\0');
         }
 
-        let mut res_len: u32 = 0;
-        sockbuff.resize(max_reslen, [0u8; 26]);
-        ai_canonname.resize(max_reslen, String::with_capacity(30));
-        sockaddr.resize(max_reslen, WasiSockaddr::default());
-        let mut wasiaddrinfo_array: Vec<WasiAddrinfo> = vec![WasiAddrinfo::default(); max_reslen];
+        let socket_type = match hints.ai_socktype {
+            SocketType::Any => socket_wamr::WasiSockType::SocketAny,
+            SocketType::Datagram => socket_wamr::WasiSockType::SocketDgram,
+            SocketType::Stream => socket_wamr::WasiSockType::SocketStream,
+        };
 
-        for i in 0..max_reslen {
-            sockaddr[i].sa_data = sockbuff[i].as_mut_ptr();
-            wasiaddrinfo_array[i].ai_addr = &mut sockaddr[i];
-            wasiaddrinfo_array[i].ai_canonname = ai_canonname[i].as_mut_ptr();
-            if i > 0 {
-                wasiaddrinfo_array[i - 1].ai_next = &mut wasiaddrinfo_array[i];
-            }
+        let address_family = match hints.ai_family {
+            AddressFamily::Inet4 => socket_wamr::WasiAddressFamily::Inet4,
+            AddressFamily::Inet6 => socket_wamr::WasiAddressFamily::Inet6,
+            _ => socket_wamr::WasiAddressFamily::InetUnspec,
+        };
+
+        let mut wamr_hints = socket_wamr::WasiAddrInfoHints {
+            type_: socket_type,
+            family: address_family,
+            hints_enabled: 0,
+        };
+        let mut addr_info_array: Vec<socket_wamr::WasiAddrInfo> =
+            vec![socket_wamr::WasiAddrInfo::default(); max_reslen];
+        let mut max_info_size = max_reslen as socket_wamr::WasiSize;
+        let errno = socket_wamr::wamr_sock_addr_resolve(
+            node.as_ptr(),
+            service.as_ptr(),
+            &mut wamr_hints,
+            addr_info_array.as_mut_ptr(),
+            max_reslen.try_into().unwrap(),
+            &mut max_info_size,
+        );
+
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno.into()));
         }
-        let mut res = wasiaddrinfo_array.as_mut_ptr() as u32;
-
-        unsafe {
-            let return_code = sock_getaddrinfo(
-                node.as_ptr(),
-                node.len() as u32,
-                service.as_ptr(),
-                service.len() as u32,
-                hints as *const WasiAddrinfo,
-                &mut res,
-                max_reslen as u32,
-                &mut res_len,
-            );
-
-            match return_code {
-                0 => Ok(wasiaddrinfo_array[..res_len as usize].to_vec()),
-                e => Err(std::io::Error::from_raw_os_error(e as i32)),
-            }
-        }
+        return Ok(addr_info_array);
     }
 }
 
@@ -344,11 +330,11 @@ mod wasi_sock {
 
     #[link(wasm_import_module = "wasi_snapshot_preview1")]
     extern "C" {
-        pub fn sock_open(addr_family: u8, sock_type: u8, fd: *mut u32) -> u32;
+        // pub fn sock_open(addr_family: u8, sock_type: u8, fd: *mut u32) -> u32;
         pub fn sock_bind(fd: u32, addr: *mut WasiAddress, port: u32) -> u32;
         pub fn sock_listen(fd: u32, backlog: u32) -> u32;
         pub fn sock_accept(fd: u32, fd: *mut u32) -> u32;
-        pub fn sock_connect(fd: u32, addr: *mut WasiAddress, port: u32) -> u32;
+        // pub fn sock_connect(fd: u32, addr: *mut WasiAddress, port: u32) -> u32;
         pub fn sock_recv(
             fd: u32,
             buf: *mut IovecRead,
@@ -385,33 +371,33 @@ mod wasi_sock {
             send_len: *mut u32,
         ) -> u32;
         pub fn sock_shutdown(fd: u32, flags: u8) -> u32;
-        pub fn sock_getpeeraddr(
-            fd: u32,
-            addr: *mut WasiAddress,
-            addr_type: *mut u32,
-            port: *mut u32,
-        ) -> u32;
-        pub fn sock_getlocaladdr(
-            fd: u32,
-            addr: *mut WasiAddress,
-            addr_type: *mut u32,
-            port: *mut u32,
-        ) -> u32;
-        pub fn sock_getsockopt(
-            fd: u32,
-            level: i32,
-            name: i32,
-            flag: *mut i32,
-            flag_size: *mut u32,
+        // pub fn sock_getpeeraddr(
+        //     fd: u32,
+        //     addr: *mut WasiAddress,
+        //     addr_type: *mut u32,
+        //     port: *mut u32,
+        // ) -> u32;
+        // pub fn sock_getlocaladdr(
+        //     fd: u32,
+        //     addr: *mut WasiAddress,
+        //     addr_type: *mut u32,
+        //     port: *mut u32,
+        // ) -> u32;
+        pub fn sock_getsockopt( // I just commented it's usage when in fact it needs to be substituted with WAMR socket ext apis
+                                fd: u32,
+                                level: i32,
+                                name: i32,
+                                flag: *mut i32,
+                                flag_size: *mut u32,
         ) -> u32;
 
         #[allow(unused)]
-        pub fn sock_setsockopt(
-            fd: u32,
-            level: i32,
-            name: i32,
-            flag: *const i32,
-            flag_size: u32,
+        pub fn sock_setsockopt( // I replaced its usage everywhere where found possible, but it could've been enough only for POC
+                                fd: u32,
+                                level: i32,
+                                name: i32,
+                                flag: *const i32,
+                                flag_size: u32,
         ) -> u32;
     }
 }
@@ -424,20 +410,7 @@ pub struct Socket {
 use std::time::Duration;
 use wasi_sock::*;
 
-fn into_timeval(duration: Option<Duration>) -> libc::timeval {
-    match duration {
-        // https://github.com/rust-lang/libc/issues/1848
-        #[cfg_attr(target_env = "musl", allow(deprecated))]
-        Some(duration) => libc::timeval {
-            tv_sec: duration.as_secs().min(libc::time_t::max_value() as u64) as libc::time_t,
-            tv_usec: duration.subsec_micros() as libc::suseconds_t,
-        },
-        None => libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-    }
-}
+use crate::socket_wamr::{self, WasiAddrIp4, WasiAddrIp4Port};
 
 fn from_timeval(duration: libc::timeval) -> Option<Duration> {
     if duration.tv_sec == 0 && duration.tv_usec == 0 {
@@ -451,14 +424,31 @@ fn from_timeval(duration: libc::timeval) -> Option<Duration> {
 
 impl Socket {
     pub fn new(addr_family: AddressFamily, sock_kind: SocketType) -> io::Result<Self> {
-        unsafe {
-            let mut fd = 0;
-            let res = sock_open(addr_family as u8, sock_kind as u8, &mut fd);
-            if res == 0 {
-                Ok(Socket { fd: fd as i32 })
-            } else {
-                Err(io::Error::from_raw_os_error(res as i32))
-            }
+        let mut socket_fd: socket_wamr::WasiFd = 0;
+        let poolfd = u32::MAX;
+
+        let wamr_address_family = match addr_family {
+            AddressFamily::Inet4 => socket_wamr::WasiAddressFamily::Inet4,
+            AddressFamily::Inet6 => socket_wamr::WasiAddressFamily::Inet6,
+            _ => socket_wamr::WasiAddressFamily::InetUnspec,
+        };
+        let wamr_sock_type = match sock_kind {
+            SocketType::Any => socket_wamr::WasiSockType::SocketAny,
+            SocketType::Datagram => socket_wamr::WasiSockType::SocketDgram,
+            SocketType::Stream => socket_wamr::WasiSockType::SocketStream,
+        };
+        let errno = socket_wamr::wamr_sock_open(
+            poolfd,
+            wamr_address_family,
+            wamr_sock_type,
+            &mut socket_fd,
+        );
+        if errno == 0 {
+            Ok(Socket {
+                fd: socket_fd as i32,
+            })
+        } else {
+            Err(io::Error::from_raw_os_error(errno as i32))
         }
     }
 
@@ -512,11 +502,13 @@ impl Socket {
     }
 
     pub fn set_send_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
-        self.setsockopt(
-            SocketOptLevel::SolSocket,
-            SocketOptName::SoSndtimeo,
-            into_timeval(duration),
-        )
+        let duration_micros = match duration {
+            Some(dur) => dur.as_micros(),
+            None => 0,
+        };
+        self.setsockopt_socket(socket_wamr::SocketOptName::SoSndtimeo(
+            duration_micros as u64,
+        ))
     }
 
     pub fn get_send_timeout(&self) -> io::Result<Option<Duration>> {
@@ -542,11 +534,13 @@ impl Socket {
     }
 
     pub fn set_recv_timeout(&self, duration: Option<std::time::Duration>) -> io::Result<()> {
-        self.setsockopt(
-            SocketOptLevel::SolSocket,
-            SocketOptName::SoRcvtimeo,
-            into_timeval(duration),
-        )
+        let duration_micros = match duration {
+            Some(dur) => dur.as_micros(),
+            None => 0,
+        };
+        self.setsockopt_socket(socket_wamr::SocketOptName::SoRcvtimeo(
+            duration_micros as u64,
+        ))
     }
 
     pub fn get_recv_timeout(&self) -> io::Result<Option<Duration>> {
@@ -945,7 +939,7 @@ impl Socket {
     }
 
     pub fn connect(&self, addrs: &SocketAddr) -> io::Result<()> {
-        let fd = self.as_raw_fd();
+        let fd: u32 = self.as_raw_fd() as u32;
         let vaddr;
         let port;
         if let SocketAddr::V4(addrs) = addrs {
@@ -954,18 +948,25 @@ impl Socket {
         } else {
             return Err(io::Error::from(io::ErrorKind::Unsupported));
         }
-        let mut addr = WasiAddress {
-            buf: vaddr.as_ptr(),
-            size: 4,
+        let wasi_addr = socket_wamr::WasiAddr {
+            kind: socket_wamr::WasiAddrType::IPv4,
+            addr: socket_wamr::WasiAddrUnion {
+                ip4: WasiAddrIp4Port {
+                    addr: WasiAddrIp4 {
+                        n0: vaddr[0],
+                        n1: vaddr[1],
+                        n2: vaddr[2],
+                        n3: vaddr[3],
+                    },
+                    port: port,
+                },
+            },
         };
-
-        unsafe {
-            let res = sock_connect(fd as u32, &mut addr, port as u32);
-            if res != 0 {
-                Err(io::Error::from_raw_os_error(res as i32))
-            } else {
-                Ok(())
-            }
+        let errno = socket_wamr::wamr_sock_connect(fd, &wasi_addr as *const _);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno as i32))
+        } else {
+            Ok(())
         }
     }
 
@@ -1029,89 +1030,78 @@ impl Socket {
     }
 
     pub fn get_local(&self) -> io::Result<SocketAddr> {
-        unsafe {
-            let fd = self.fd;
-            let addr_buf = [0u8; 16];
-            let mut addr = WasiAddress {
-                buf: addr_buf.as_ptr(),
-                size: 16,
-            };
-            let mut addr_type = 0;
-            let mut port = 0;
-            let res = sock_getlocaladdr(fd as u32, &mut addr, &mut addr_type, &mut port);
-            if res != 0 {
-                Err(io::Error::from_raw_os_error(res as i32))
+        let fd: u32 = self.fd as u32;
+        let mut wasi_addr = socket_wamr::WasiAddr::default();
+        let errno = socket_wamr::wamr_sock_addr_local(fd, &mut wasi_addr);
+
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno as i32))
+        } else {
+            if wasi_addr.kind == socket_wamr::WasiAddrType::IPv4 {
+                let addr = unsafe { wasi_addr.addr.ip4.addr };
+                let ip_addr = Ipv4Addr::new(addr.n0, addr.n1, addr.n2, addr.n3);
+                let port = unsafe { wasi_addr.addr.ip4.port };
+                Ok(SocketAddr::V4(SocketAddrV4::new(ip_addr, port)))
+            } else if wasi_addr.kind == socket_wamr::WasiAddrType::IPv6 {
+                let addr = unsafe { wasi_addr.addr.ip6.addr };
+                let port = unsafe { wasi_addr.addr.ip6.port };
+                let ip_addr = Ipv6Addr::new(
+                    addr.n0, addr.n1, addr.n2, addr.n3, addr.h0, addr.h1, addr.h2, addr.h3,
+                );
+                Ok(SocketAddr::V6(SocketAddrV6::new(ip_addr, port, 0, 0)))
             } else {
-                if addr_type == 4 || addr_type == AddressFamily::Inet4 as u8 as u32 {
-                    let ip_addr = Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
-                    Ok(SocketAddr::V4(SocketAddrV4::new(ip_addr, port as u16)))
-                } else if addr_type == 6 || addr_type == AddressFamily::Inet6 as u8 as u32 {
-                    let ip_addr = Ipv6Addr::from(addr_buf);
-                    Ok(SocketAddr::V6(SocketAddrV6::new(
-                        ip_addr,
-                        port as u16,
-                        0,
-                        0,
-                    )))
-                } else {
-                    Err(io::Error::from(io::ErrorKind::Unsupported))
-                }
+                Err(io::Error::from(io::ErrorKind::Unsupported))
             }
         }
     }
 
     pub fn get_peer(&self) -> io::Result<SocketAddr> {
-        unsafe {
-            let fd = self.fd;
-            let addr_buf = [0u8; 16];
-            let mut addr = WasiAddress {
-                buf: addr_buf.as_ptr(),
-                size: 16,
-            };
-            let mut addr_type = 0;
-            let mut port = 0;
-            let res = sock_getpeeraddr(fd as u32, &mut addr, &mut addr_type, &mut port);
-            if res != 0 {
-                Err(io::Error::from_raw_os_error(res as i32))
+        let fd: u32 = self.fd as u32;
+        let mut wasi_addr = socket_wamr::WasiAddr::default();
+        let errno = socket_wamr::wamr_sock_addr_remote(fd, &mut wasi_addr);
+
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno as i32))
+        } else {
+            if wasi_addr.kind == socket_wamr::WasiAddrType::IPv4 {
+                let addr = unsafe { wasi_addr.addr.ip4.addr };
+                let ip_addr = Ipv4Addr::new(addr.n0, addr.n1, addr.n2, addr.n3);
+                let port = unsafe { wasi_addr.addr.ip4.port };
+                Ok(SocketAddr::V4(SocketAddrV4::new(ip_addr, port)))
+            } else if wasi_addr.kind == socket_wamr::WasiAddrType::IPv6 {
+                let addr = unsafe { wasi_addr.addr.ip6.addr };
+                let port = unsafe { wasi_addr.addr.ip6.port };
+                let ip_addr = Ipv6Addr::new(
+                    addr.n0, addr.n1, addr.n2, addr.n3, addr.h0, addr.h1, addr.h2, addr.h3,
+                );
+                Ok(SocketAddr::V6(SocketAddrV6::new(ip_addr, port, 0, 0)))
             } else {
-                if addr_type == 4 || addr_type == AddressFamily::Inet4 as u8 as u32 {
-                    let ip_addr = Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
-                    Ok(SocketAddr::V4(SocketAddrV4::new(ip_addr, port as u16)))
-                } else if addr_type == 6 || addr_type == AddressFamily::Inet6 as u8 as u32 {
-                    let ip_addr = Ipv6Addr::from(addr_buf);
-                    Ok(SocketAddr::V6(SocketAddrV6::new(
-                        ip_addr,
-                        port as u16,
-                        0,
-                        0,
-                    )))
-                } else {
-                    Err(io::Error::from(io::ErrorKind::Unsupported))
-                }
+                Err(io::Error::from(io::ErrorKind::Unsupported))
             }
         }
     }
 
     pub fn take_error(&self) -> io::Result<()> {
-        unsafe {
-            let fd = self.fd;
-            let mut error = 0;
-            let mut len = std::mem::size_of::<i32>() as u32;
-            let res = sock_getsockopt(
-                fd as u32,
-                SocketOptLevel::SolSocket as i32,
-                SocketOptName::SoError as i32,
-                &mut error,
-                &mut len,
-            );
-            if res == 0 && error == 0 {
-                Ok(())
-            } else if res == 0 && error != 0 {
-                Err(io::Error::from_raw_os_error(error))
-            } else {
-                Err(io::Error::from_raw_os_error(res as i32))
-            }
-        }
+        Ok(())
+        // unsafe {
+        //     let fd = self.fd;
+        //     let mut error = 0;
+        //     let mut len = std::mem::size_of::<i32>() as u32;
+        //     let res = sock_getsockopt(
+        //         fd as u32,
+        //         SocketOptLevel::SolSocket as i32,
+        //         SocketOptName::SoError as i32,
+        //         &mut error,
+        //         &mut len,
+        //     );
+        //     if res == 0 && error == 0 {
+        //         Ok(())
+        //     } else if res == 0 && error != 0 {
+        //         Err(io::Error::from_raw_os_error(error))
+        //     } else {
+        //         Err(io::Error::from_raw_os_error(res as i32))
+        //     }
+        // }
     }
 
     pub fn is_listener(&self) -> io::Result<bool> {
@@ -1277,6 +1267,76 @@ impl Socket {
         }
     }
 
+    pub fn setsockopt_socket(&self, name: socket_wamr::SocketOptName) -> io::Result<()> {
+        let fd = self.fd as u32;
+        let errno = match name {
+            socket_wamr::SocketOptName::SoBroadcast(value) => {
+                socket_wamr::wamr_sock_set_broadcast(fd, value)
+            }
+            socket_wamr::SocketOptName::SoKeepalive(value) => {
+                socket_wamr::wamr_sock_set_keep_alive(fd, value)
+            }
+            socket_wamr::SocketOptName::SoRcvbuf(value) => {
+                socket_wamr::wamr_sock_set_recv_buf_size(fd, value)
+            }
+            socket_wamr::SocketOptName::SoReuseaddr(value) => {
+                socket_wamr::wamr_sock_set_reuse_addr(fd, value)
+            }
+            socket_wamr::SocketOptName::SoReuseport(value) => {
+                socket_wamr::wamr_sock_set_reuse_port(fd, value)
+            }
+            socket_wamr::SocketOptName::SoSndbuf(value) => {
+                socket_wamr::wamr_sock_set_send_buf_size(fd, value)
+            }
+            socket_wamr::SocketOptName::SoRcvtimeo(value) => {
+                socket_wamr::wamr_sock_set_recv_timeout(fd, value)
+            }
+            socket_wamr::SocketOptName::SoSndtimeo(value) => {
+                socket_wamr::wamr_sock_set_send_timeout(fd, value)
+            }
+        };
+        if errno == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(errno as i32))
+        }
+    }
+
+    pub fn getsockopt_socket(&self, name: socket_wamr::SocketOptName) -> io::Result<()> {
+        let fd = self.fd as u32;
+        let errno = match name {
+            socket_wamr::SocketOptName::SoBroadcast(value) => {
+                socket_wamr::wamr_sock_set_broadcast(fd, value)
+            }
+            socket_wamr::SocketOptName::SoKeepalive(value) => {
+                socket_wamr::wamr_sock_set_keep_alive(fd, value)
+            }
+            socket_wamr::SocketOptName::SoRcvbuf(value) => {
+                socket_wamr::wamr_sock_set_recv_buf_size(fd, value)
+            }
+            socket_wamr::SocketOptName::SoReuseaddr(value) => {
+                socket_wamr::wamr_sock_set_reuse_addr(fd, value)
+            }
+            socket_wamr::SocketOptName::SoReuseport(value) => {
+                socket_wamr::wamr_sock_set_reuse_port(fd, value)
+            }
+            socket_wamr::SocketOptName::SoSndbuf(value) => {
+                socket_wamr::wamr_sock_set_send_buf_size(fd, value)
+            }
+            socket_wamr::SocketOptName::SoRcvtimeo(value) => {
+                socket_wamr::wamr_sock_set_recv_timeout(fd, value)
+            }
+            socket_wamr::SocketOptName::SoSndtimeo(value) => {
+                socket_wamr::wamr_sock_set_send_timeout(fd, value)
+            }
+        };
+        if errno == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(errno as i32))
+        }
+    }
+
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         unsafe {
             let flags = match how {
@@ -1304,12 +1364,6 @@ impl Drop for Socket {
 impl AsRawFd for Socket {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
-    }
-}
-
-impl AsFd for Socket {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
     }
 }
 
