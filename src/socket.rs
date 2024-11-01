@@ -410,7 +410,7 @@ pub struct Socket {
 use std::time::Duration;
 use wasi_sock::*;
 
-use crate::socket_wamr::{self, WasiAddrIp4, WasiAddrIp4Port};
+use crate::socket_wamr::{self, wamr_sock_bind, WasiAddrIp4, WasiAddrIp4Port, WasiAddrType};
 
 fn from_timeval(duration: libc::timeval) -> Option<Duration> {
     if duration.tv_sec == 0 && duration.tv_usec == 0 {
